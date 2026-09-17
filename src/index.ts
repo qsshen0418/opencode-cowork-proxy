@@ -12,6 +12,11 @@ const ZEN_UPSTREAM = "https://opencode.ai/zen/v1";
 const DEFAULT_UPSTREAM = GO_UPSTREAM;
 const VISION_MODEL = "qwen3.6-plus";
 
+// OpenCode Go requires a coding-agent user-agent and a stable per-conversation
+// session id (x-opencode-session); without them it returns 400. See
+// https://opencode.ai/docs/go/#where-can-i-use-it
+const USER_AGENT = "opencode-cowork-proxy/1.0";
+
 const API_START_PATHS = new Set(['v1', 'v2']);
 
 type RouteConfig = {
@@ -61,11 +66,28 @@ function upstreamFormat(request: Request): "openai" | "anthropic" {
   return fmt === "anthropic" ? "anthropic" : "openai";
 }
 
+// Reuse a client-supplied session id when present (so callers can keep a stable
+// conversation), otherwise mint one so the upstream always gets a value.
+function sessionId(request: Request): string {
+  return request.headers.get("x-opencode-session") || crypto.randomUUID();
+}
+
+function openaiHeaders(request: Request, key: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "Authorization": `Bearer ${key}`,
+    "x-opencode-session": sessionId(request),
+    "User-Agent": USER_AGENT,
+  };
+}
+
 function anthropicHeaders(request: Request, key: string): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "X-Api-Key": key,
     "Anthropic-Version": request.headers.get("Anthropic-Version") || "2023-06-01",
+    "x-opencode-session": sessionId(request),
+    "User-Agent": USER_AGENT,
   };
   const beta = request.headers.get("Anthropic-Beta");
   if (beta) headers["Anthropic-Beta"] = beta;
@@ -110,10 +132,7 @@ async function handleRequest(request: Request): Promise<Response> {
         const openaiReq = formatAnthropicToOpenAI(req);
         const res = await fetch(`${upstream}/chat/completions`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${key}`,
-          },
+          headers: openaiHeaders(request, key!),
           body: JSON.stringify(openaiReq),
         });
         if (!res.ok) return upstreamErrorResponse(res, await res.text());
@@ -168,7 +187,7 @@ async function handleRequest(request: Request): Promise<Response> {
       // Pass-through to OpenAI upstream
       const res = await fetch(`${upstream}/chat/completions`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+        headers: openaiHeaders(request, key!),
         body: await request.text(),
       });
       return res;
@@ -187,7 +206,7 @@ async function handleRequest(request: Request): Promise<Response> {
           })
         : await fetch(`${upstream}/models`, {
             method: "GET",
-            headers: { "Authorization": `Bearer ${key}` },
+            headers: openaiHeaders(request, key),
       });
       if (!res.ok) return upstreamErrorResponse(res, await res.text());
       return new Response(await res.text(), { headers: { "Content-Type": "application/json" } });
